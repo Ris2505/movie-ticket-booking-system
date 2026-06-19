@@ -1,0 +1,20 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/moviebooking
+    username: moviebooking
+    password: moviebooking
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+
+  flyway:
+    enabled: true
+
+app:
+  hold-duration-minutes: 5
+  reminder-hours-before-show: 2
+
+logging:
+  level:
+    com.moviebooking: WARN

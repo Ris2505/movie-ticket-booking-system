@@ -2,9 +2,9 @@
 
 ## Overview
 
-REST service for browsing shows, holding seats, confirming bookings, and cancelling tickets. Two roles: **Admin** (catalog setup) and **Customer** (browse, book, cancel).
+REST service for browsing shows, holding seats, confirming bookings, and cancelling tickets. Two roles: **Admin** (catalog + policy setup) and **Customer** (browse, book, cancel).
 
-**Stack:** Spring Boot, PostgreSQL, session auth, Flyway migrations.
+**Stack:** Spring Boot 3, PostgreSQL, Flyway, session auth (cookie), Testcontainers for integration tests.
 
 ---
 
@@ -12,226 +12,267 @@ REST service for browsing shows, holding seats, confirming bookings, and cancell
 
 | Topic | Choice |
 |-------|--------|
-| Auth | Session-based (cookie) |
-| Hold duration | 5 minutes, auto-released by scheduler |
+| Auth | Session-based (cookie); BCrypt passwords; `@PreAuthorize` RBAC |
+| Hold duration | 5 min; scheduler releases expired holds every 30s |
 | Multi-seat hold | All-or-nothing |
-| Price lock | At hold time |
-| Cancellation | Partial seat cancellation allowed |
-| Payment | Mock providers via Strategy pattern (CARD, UPI, WALLET) |
-| Notifications | Async after booking (log/DB in v1; full queue in v2) |
-| Weekend pricing | Based on show start time in IST |
+| Price lock | At hold time (tier + weekend + discount applied at confirm) |
+| Discount | Single code per booking; validated at confirm; stored on booking |
+| Cancellation | Partial seat cancel allowed |
+| Refund policy | Admin-configurable rules (hours-before-show → refund %) |
+| Payment | Mock Strategy pattern (CARD, UPI, WALLET); `token_success` / `token_fail` |
+| Notifications | `@Async` after confirm/cancel/reminder; persisted log table (non-blocking) |
+| Weekend pricing | Show start time in IST |
+| API docs | springdoc-openapi (Swagger UI) for manual testing only |
 
 ---
 
 ## Architecture
 
-Single monolith. Layered: **Controller → Service → Repository**.
+Single monolith. **Controller → Service → Repository**.
 
 ```
 Client → REST API → Services → PostgreSQL
                       ↓
               Payment Strategy (mock)
-              Async notifications
-              Scheduled jobs (hold expiry, reminders)
+              @Async notifications
+              Schedulers (hold expiry, show reminders)
 ```
 
-**Concurrency approach:** pessimistic row locks (`SELECT FOR UPDATE`) on `show_seats` inside transactions. Backup: optimistic `@Version` on hot rows.
+**Concurrency:** pessimistic row locks (`SELECT FOR UPDATE`) on `show_seats` inside short transactions. `@Version` on `show_seats` as safety net.
 
-**Idempotency:** client sends `Idempotency-Key` header on confirm booking. Same key returns the existing booking instead of creating a duplicate.
+**Idempotency:** `Idempotency-Key` header on `POST /bookings`. Same key + same payload → return existing booking (201/200).
 
 ---
 
-## Database (Core Tables)
-
-11 tables. Payment and pricing config kept inline to avoid extra tables in v1.
+## Database (13 tables)
 
 | Table | Purpose |
 |-------|---------|
-| `users` | email, password, role (ADMIN / CUSTOMER) |
-| `cities` | city name |
-| `theaters` | belongs to city |
-| `screens` | auditorium in a theater |
-| `seats` | row, number, tier (REGULAR / PREMIUM) per screen |
-| `movies` | title, duration |
-| `shows` | movie + screen + start/end time, status |
-| `show_seats` | per-show seat state: AVAILABLE / HELD / BOOKED |
-| `holds` | groups held seats: user, show, expires_at, status |
-| `bookings` | user, show, hold, amounts, payment fields, status |
-| `booking_seats` | seats in a booking: price_paid, ACTIVE / CANCELLED |
+| `users` | email, password_hash, role (ADMIN / CUSTOMER) |
+| `cities` | name |
+| `theaters` | city_id |
+| `screens` | theater_id, name |
+| `seats` | screen_id, row, number, tier (REGULAR / PREMIUM) |
+| `movies` | title, duration_minutes |
+| `shows` | movie_id, screen_id, start/end, status (SCHEDULED / CANCELLED) |
+| `show_seats` | per-show seat state |
+| `holds` | user, show, expires_at, status |
+| `bookings` | user, show, hold, amounts, discount, payment, idempotency_key |
+| `booking_seats` | seat, price_paid, refund_amount, status |
+| `discount_codes` | code, type (PERCENT / FLAT), value, max_uses, valid_until, active |
+| `refund_policies` | name, rules JSON: `[{hoursBeforeShow, refundPercent}]` |
+| `notifications` | user_id, booking_id, type, channel, status, payload (audit + demo) |
 
-### Key columns on `show_seats`
+### `show_seats` key columns
 
-- `status`, `hold_id`, `held_until`, `locked_price`, `booking_id`
-- Unique on `(show_id, seat_id)`
+`status` (AVAILABLE / HELD / BOOKED), `hold_id`, `held_until`, `locked_base_price`, `booking_id`  
+Unique: `(show_id, seat_id)` · Index: `(show_id, status)`
 
-When admin creates a show, copy all screen seats into `show_seats` as AVAILABLE.
+Show creation copies all screen seats → `show_seats` as AVAILABLE.
 
-### Pricing (v1)
-
-No separate pricing table. Rules in config/code:
+### Pricing (computed at hold, finalized at confirm)
 
 ```
-REGULAR  + weekday (IST) → base price
-REGULAR  + weekend       → higher
-PREMIUM  + weekday       → higher
-PREMIUM  + weekend       → highest
+base = tier price (REGULAR/PREMIUM) × weekend multiplier (IST)
+discount applied at confirm → stored as booking.discount_amount
+final = sum(locked_base_price) - discount
 ```
 
-Price computed at hold time and stored on `show_seats.locked_price`.
+Tier prices + weekend multiplier in `application.yml` (admin API to update in v1).
 
-### Payment (v1)
+### Refund (at cancel)
 
-Fields on `bookings`: `payment_method`, `payment_status`, `provider_ref`.  
-Strategy interface with mock CARD / UPI / WALLET providers (`token_success` / `token_fail`).
+Lookup show's `refund_policy_id` → pick rule by `hoursBeforeShow` → `refund = price_paid × percent`. After show start → 0%.
 
 ---
 
-## State Flow
+## State Machines
 
-**Seat:** `AVAILABLE → HELD → BOOKED → AVAILABLE` (on cancel)
-
-**Hold:** `ACTIVE → CONSUMED` (on book) or `EXPIRED / RELEASED`
-
-**Booking:** `CONFIRMED → PARTIALLY_CANCELLED → CANCELLED`
+| Entity | Transitions |
+|--------|-------------|
+| Seat | AVAILABLE → HELD → BOOKED → AVAILABLE |
+| Hold | ACTIVE → CONSUMED \| EXPIRED \| RELEASED |
+| Booking | CONFIRMED → PARTIALLY_CANCELLED → CANCELLED |
+| Payment | PENDING → SUCCESS \| FAILED |
+| Notification | PENDING → SENT \| FAILED |
 
 ---
 
 ## API Endpoints
 
 ### Auth
-- `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`
+`POST /auth/register` · `POST /auth/login` · `POST /auth/logout` · `GET /auth/me`
 
-### Admin
+### Admin (role ADMIN)
 - CRUD: cities, theaters, screens, seats (bulk layout)
 - CRUD: movies, shows (auto-generates `show_seats`)
-- Manage pricing config (or app config in v1)
+- `PUT /admin/pricing` — tier + weekend config
+- CRUD: `discount_codes`, `refund_policies`
+- `PATCH /shows/{id}/cancel` — cancel show, release seats, notify bookers
 
-### Customer
-- `GET /cities`, `GET /cities/{id}/theaters`
-- `GET /shows?cityId&movieId&date`, `GET /shows/{id}`, `GET /shows/{id}/seats`
-- `POST /shows/{id}/holds` — hold seats
-- `DELETE /holds/{id}` — release hold
-- `POST /bookings` — confirm from hold + payment
-- `GET /bookings`, `GET /bookings/{id}`
-- `POST /bookings/{id}/cancel` — partial or full cancel
+### Customer (role CUSTOMER)
+- Browse: cities, theaters, shows (filter by city/movie/date), show detail, seat map
+- `POST /shows/{id}/holds` · `DELETE /holds/{id}`
+- `POST /bookings` (body: holdId, paymentMethod, paymentToken, discountCode?, header: Idempotency-Key)
+- `GET /bookings` · `GET /bookings/{id}`
+- `POST /bookings/{id}/cancel` (body: seatIds[])
 
 ---
 
 ## Core Flows
 
-### Hold seats
-1. Start transaction
-2. Lock requested `show_seats` rows
-3. If any seat is not AVAILABLE → rollback, return 409
-4. Set HELD, attach `hold_id`, set `held_until = now + 5min`, compute and store `locked_price`
-5. Create `holds` record, commit
+### Hold
+1. Tx: lock `show_seats` FOR UPDATE
+2. All AVAILABLE? else 409
+3. Set HELD, attach hold, `held_until = now+5m`, store `locked_base_price`
+4. Create `holds` ACTIVE · commit
 
-### Confirm booking
-1. Validate hold is ACTIVE, not expired, belongs to user
-2. Lock seats again
-3. Charge via payment strategy
-4. On success: seats → BOOKED, hold → CONSUMED, create booking + booking_seats
-5. Fire async confirmation (non-blocking)
-6. Support idempotency key to prevent double confirm
+### Confirm
+1. Validate hold (ACTIVE, not expired, owner)
+2. Tx: re-lock seats, validate still HELD under this hold
+3. Apply discount if code valid
+4. Payment strategy charge
+5. Success: seats BOOKED, hold CONSUMED, create booking + booking_seats
+6. `@Async` confirmation notification (API returns immediately)
+7. Idempotency: duplicate key → return existing booking
 
-### Cancel seats
-1. Lock booking and related show_seats
-2. Mark selected `booking_seats` as CANCELLED
-3. Release those show_seats to AVAILABLE
-4. Compute refund from simple policy (hours before show → refund %)
-5. Update payment status, enqueue cancel notification
+### Cancel (partial/full)
+1. Tx: lock booking + seats
+2. Mark selected booking_seats CANCELLED, release show_seats
+3. Compute per-seat refund from policy
+4. Update booking status, `@Async` cancel notification
 
-### Hold expiry job (every 30s)
-Release seats where `status = HELD AND held_until < now()`. Mark hold EXPIRED.
-
----
-
-## Edge Cases
-
-| Case | Handling |
-|------|----------|
-| Two users book same seat | Row lock; second request gets 409 |
-| Hold expires mid-checkout | Confirm fails with HOLD_EXPIRED |
-| Double-click confirm | Idempotency-Key returns same booking |
-| Payment fails | Rollback; seats stay held until expiry |
-| One of N seats taken | All-or-nothing: reject entire hold |
-| Partial cancel | Refund per seat; booking → PARTIALLY_CANCELLED |
-| Cancel after show start | 0% refund |
-| User accesses other's booking | 404 |
-| Book on cancelled show | Block at hold time |
-| Empty seat list | 400 validation error |
-| Confirm without valid hold | 409 |
+### Schedulers
+- **Hold expiry** (30s): HELD + past `held_until` → AVAILABLE, hold EXPIRED
+- **Reminders** (hourly): shows starting in ~2h → reminder notification to confirmed bookers (skip if already sent)
 
 ---
 
 ## Error Handling
 
-Consistent JSON error body: `code`, `message`, optional `details`.
+JSON: `{ "code", "message", "details?" }` via `@RestControllerAdvice`
 
 | Status | When |
 |--------|------|
-| 400 | Invalid input |
-| 401 | Not logged in |
+| 400 | Validation, invalid discount, empty seat list |
+| 401 | Not authenticated |
 | 403 | Wrong role |
-| 404 | Not found |
+| 404 | Not found / not owner (no existence leak) |
 | 409 | Seat conflict, expired hold, invalid state |
 | 402 | Payment failed |
 
-Global `@RestControllerAdvice`. Never leak stack traces to clients.
+---
+
+## Testing — Closed Loop
+
+Tests run against real PostgreSQL (Testcontainers). Each scenario: **setup → act → assert DB state + HTTP response + side effects**.
+
+### Unit tests (no DB)
+
+| Area | Cases |
+|------|-------|
+| PricingService | weekday/weekend × REGULAR/PREMIUM; IST boundary (Fri→Sat midnight) |
+| DiscountService | valid/ expired/ max-uses-exceeded/ inactive code |
+| RefundService | policy tiers; 0% after show start; partial seat amounts |
+| PaymentStrategy | token_success → SUCCESS; token_fail → FAILED |
+| State guards | invalid transitions rejected |
+
+### Integration tests (Testcontainers + MockMvc)
+
+| # | Scenario | Assert |
+|---|----------|--------|
+| 1 | Admin creates city→theater→screen→seats→movie→show | show_seats count = screen seat count, all AVAILABLE |
+| 2 | Customer browses shows by city/date | 200, filtered list |
+| 3 | Hold 2 seats happy path | 201, seats HELD, hold ACTIVE, prices locked |
+| 4 | **Concurrent hold same seat** | 2 threads: exactly 1 succeeds (201), 1 fails (409) |
+| 5 | Hold with 1 seat already HELD | all-or-nothing 409, no partial hold |
+| 6 | Release hold | seats AVAILABLE, hold RELEASED |
+| 7 | Confirm with token_success | booking CONFIRMED, seats BOOKED, payment SUCCESS |
+| 8 | Confirm with token_fail | 402, seats still HELD, no booking row |
+| 9 | **Idempotent confirm** | same Idempotency-Key twice → 1 booking row |
+| 10 | Confirm expired hold | 409 HOLD_EXPIRED |
+| 11 | Confirm with valid discount | discount_amount correct, final total correct |
+| 12 | Confirm with invalid discount | 400 |
+| 13 | **Hold expiry job** | advance clock / short TTL → seats AVAILABLE, hold EXPIRED |
+| 14 | Partial cancel (2 of 3 seats) | PARTIALLY_CANCELLED, refund per policy, seats released |
+| 15 | Full cancel | CANCELLED, all seats AVAILABLE |
+| 16 | Cancel after show start | 0 refund |
+| 17 | Customer cannot read other's booking | 404 |
+| 18 | Customer cannot call admin API | 403 |
+| 19 | Async notification | confirm returns before notification completes; notification row SENT |
+| 20 | Reminder job | booking exists, show in window → reminder notification created |
+
+### Concurrency test pattern
+
+```java
+// ExecutorService: N threads POST hold on same seatIds
+// CountDownLatch start gate → assert exactly 1 success
+```
+
+Use `@Sql` or test fixtures for seed data. `@Transactional` **off** for concurrency tests.
 
 ---
 
-## DB and Scale Best Practices (reference only)
+## Acceptance Criteria
 
-Not implementing distributed architecture in v1. Document these for future scale:
+### Auth & RBAC
+- [ ] Register/login/logout works; session cookie required for protected routes
+- [ ] ADMIN vs CUSTOMER enforced on all admin/customer endpoints
 
-**Database**
-- Use transactions + row-level locks for seat mutations
-- Index `(show_id, status)` on `show_seats`
-- Unique constraint on `(show_id, seat_id)` prevents duplicate rows
-- Connection pooling (HikariCP), read replicas for browse queries at scale
-- Partition `bookings` by date if volume grows
+### Catalog (Admin)
+- [ ] Full CRUD chain: city → theater → screen → seats → movie → show
+- [ ] Creating show materializes all show_seats
+- [ ] Admin can manage discount codes and refund policies
 
-**Concurrency**
-- Short transactions: lock only during hold/confirm/cancel, not during payment UI wait
-- Optimistic locking (`version` column) as fallback on conflict
-- Hold TTL avoids indefinite seat blocking
+### Browse (Customer)
+- [ ] List shows with city/movie/date filters
+- [ ] Seat map reflects live status (AVAILABLE / HELD / BOOKED)
 
-**Idempotency**
-- Store idempotency keys on bookings with unique index
-- Safe retries on network failures
+### Booking
+- [ ] Hold locks seats for 5 min with price locked at hold time
+- [ ] Concurrent holds on same seat: no double allocation
+- [ ] Confirm charges mock payment, creates booking, marks seats BOOKED
+- [ ] Idempotent confirm prevents duplicate bookings
+- [ ] Discount code applied correctly at confirm
+- [ ] Payment failure does not create booking; seats remain held
 
-**Distributed (future)**
-- Outbox pattern for notifications (DB row → async worker)
-- Redis for hold TTL if DB sweep is too slow
-- Kafka/SQS for event-driven booking confirmations
-- Saga or compensating transactions for payment + booking across services
-- Rate limit hold endpoint per user
+### Cancel & Refund
+- [ ] Partial and full cancel supported
+- [ ] Refund % follows configured policy by hours-before-show
+- [ ] Cancelled seats become AVAILABLE again
+
+### Background jobs
+- [ ] Expired holds auto-release seats
+- [ ] Reminder notifications sent for upcoming shows
+- [ ] Confirm/cancel API responses not blocked by notification delivery
+
+### Quality
+- [ ] Input validation on all write endpoints
+- [ ] Consistent error JSON with correct HTTP status codes
+- [ ] README documents assumptions, how to run, test commands
+- [ ] All integration tests above pass locally
 
 ---
 
 ## Implementation Order
 
-1. Project setup, Flyway, entities, seed data
-2. Auth + RBAC (session)
-3. Admin catalog APIs + show creation (generates show_seats)
-4. Browse + seat map
-5. Hold flow with concurrency
-6. Booking confirm + mock payment strategy
-7. Partial cancel + refund logic
-8. Schedulers (hold expiry) + async notifications
-9. Integration tests (hold conflict, expiry, idempotent confirm, partial cancel)
+1. Boot + Flyway + entities + docker-compose Postgres
+2. Auth + RBAC + global exception handler
+3. Admin catalog APIs + show → show_seats generation
+4. Pricing + discount + refund services (unit tests)
+5. Browse + seat map APIs
+6. Hold flow + concurrency integration test
+7. Confirm + mock payment + idempotency + discount
+8. Cancel + refund policy
+9. Schedulers (hold expiry, reminders) + async notifications
+10. Remaining integration tests + README
 
 ---
 
+## Out of Scope (v1)
+
+UI/frontend, Docker deploy/CI/CD, microservices, OAuth/SSO, Redis/Kafka, real payment gateway, email/SMS delivery (log to DB only).
+
 ## V2 (Later)
 
-- `discount_codes` table + validate/apply API
-- `refund_policies` table (configurable rules per show)
-- `notifications` queue table with retry worker
-- Separate `payments` and `refunds` tables for audit trail
-- `pricing_rules` admin-managed table
-- Per-theater timezone
-- Admin bulk show cancel + notify all bookers
-- Pagination, search, booking analytics
-- Redis hold cache, outbox pattern, read replicas
+Separate `payments`/`refunds` audit tables, outbox + retry worker, Redis hold cache, read replicas, pagination/search, per-theater timezone.

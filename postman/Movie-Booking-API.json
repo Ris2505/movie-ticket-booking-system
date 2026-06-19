@@ -1,0 +1,211 @@
+{
+  "info": {
+    "name": "Movie Ticket Booking API",
+    "description": "Demo collection for movie ticket booking system",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080" },
+    { "key": "cityId", "value": "" },
+    { "key": "theaterId", "value": "" },
+    { "key": "screenId", "value": "" },
+    { "key": "movieId", "value": "" },
+    { "key": "showId", "value": "" },
+    { "key": "seatId", "value": "" },
+    { "key": "holdId", "value": "" },
+    { "key": "bookingId", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Register Admin",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@demo.com\",\n  \"password\": \"password123\",\n  \"role\": \"ADMIN\"\n}"
+            },
+            "url": "{{baseUrl}}/auth/register"
+          }
+        },
+        {
+          "name": "Register Customer",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"customer@demo.com\",\n  \"password\": \"password123\",\n  \"role\": \"CUSTOMER\"\n}"
+            },
+            "url": "{{baseUrl}}/auth/register"
+          }
+        },
+        {
+          "name": "Login Admin",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@demo.com\",\n  \"password\": \"password123\"\n}"
+            },
+            "url": "{{baseUrl}}/auth/login"
+          }
+        },
+        {
+          "name": "Login Customer",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"customer@demo.com\",\n  \"password\": \"password123\"\n}"
+            },
+            "url": "{{baseUrl}}/auth/login"
+          }
+        },
+        {
+          "name": "Me",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/auth/me"
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/auth/logout"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin Catalog",
+      "item": [
+        {
+          "name": "Create City",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Mumbai\"\n}" },
+            "url": "{{baseUrl}}/admin/cities"
+          }
+        },
+        {
+          "name": "Create Theater",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"PVR Andheri\"\n}" },
+            "url": "{{baseUrl}}/admin/cities/{{cityId}}/theaters"
+          }
+        },
+        {
+          "name": "Create Screen",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Screen 1\"\n}" },
+            "url": "{{baseUrl}}/admin/theaters/{{theaterId}}/screens"
+          }
+        },
+        {
+          "name": "Bulk Create Seats",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    { \"rowLabel\": \"A\", \"seatNumber\": 1, \"tier\": \"REGULAR\" },\n    { \"rowLabel\": \"A\", \"seatNumber\": 2, \"tier\": \"PREMIUM\" }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/admin/screens/{{screenId}}/seats"
+          }
+        },
+        {
+          "name": "Create Movie",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"title\": \"Inception\",\n  \"durationMinutes\": 148\n}" },
+            "url": "{{baseUrl}}/admin/movies"
+          }
+        },
+        {
+          "name": "Create Show",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"movieId\": {{movieId}},\n  \"screenId\": {{screenId}},\n  \"startTime\": \"2026-06-25T14:00:00Z\",\n  \"endTime\": \"2026-06-25T16:28:00Z\"\n}"
+            },
+            "url": "{{baseUrl}}/admin/shows"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Customer Booking",
+      "item": [
+        {
+          "name": "List Shows",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/shows?cityId={{cityId}}"
+          }
+        },
+        {
+          "name": "Seat Map",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/shows/{{showId}}/seats"
+          }
+        },
+        {
+          "name": "Hold Seats",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"seatIds\": [{{seatId}}]\n}" },
+            "url": "{{baseUrl}}/shows/{{showId}}/holds"
+          }
+        },
+        {
+          "name": "Confirm Booking",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "demo-key-1" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"holdId\": {{holdId}},\n  \"paymentMethod\": \"CARD\",\n  \"paymentToken\": \"token_success\"\n}"
+            },
+            "url": "{{baseUrl}}/bookings"
+          }
+        },
+        {
+          "name": "List My Bookings",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/bookings"
+          }
+        },
+        {
+          "name": "Cancel Booking (partial)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"seatIds\": [{{seatId}}]\n}" },
+            "url": "{{baseUrl}}/bookings/{{bookingId}}/cancel"
+          }
+        }
+      ]
+    }
+  ]
+}
